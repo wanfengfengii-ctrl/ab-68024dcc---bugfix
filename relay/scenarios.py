@@ -195,6 +195,28 @@ def scenario_timeout_then_ok(api: str, admin: str) -> SmokeResult:
                        f"attempts=2, deliveryId={view['deliveryId']}", view)
 
 
+def scenario_late_accept_after_all_timeouts(api: str, admin: str) -> SmokeResult:
+    # 连续 4 次请求各延迟 12s（均超过客户端 3s 超时）：4 次尝试全部超时后，
+    # 接收端挂起的处理线程仍会醒来并接纳该 deliveryId。发送端重试耗尽后
+    # 必须先与接收端核对终态，最终收敛为 delivered，且接收端只接纳一次。
+    client.set_fault(admin, "stall", count=4, seconds=12)
+    try:
+        alert = _unique_alert()
+        view = _post_and_poll(api, alert, _delivered, timeout=90.0)
+    finally:
+        client.set_fault(admin, "ok")
+    assert view["attempts"] == 4, (
+        f"4 次超时后迟到接纳，应 attempts=4，实际 {view['attempts']}"
+    )
+    ids = _receiver_delivery_ids(admin)
+    assert ids.count(view["deliveryId"]) == 1, "接收端应恰好接纳一次"
+    assert "唯一接纳" in view["conclusion"], view["conclusion"]
+    return SmokeResult(
+        "连续四次超时后接收端迟到接纳：两端收敛一致为 delivered", True,
+        f"attempts=4, deliveryId={view['deliveryId']}", view,
+    )
+
+
 SCENARIOS = [
     scenario_happy_path,
     scenario_replay,
@@ -204,6 +226,7 @@ SCENARIOS = [
     scenario_4xx_fatal,
     scenario_retries_exhausted,
     scenario_timeout_then_ok,
+    scenario_late_accept_after_all_timeouts,
 ]
 
 

@@ -7,6 +7,10 @@
 * 超时/断连    —— 可重试（对方可能已接纳，下一次靠 deliveryId 幂等收敛）。
 
 每次重试用的 body 字节、deliveryId、签名都来自首次受理时入库的同一份数据。
+
+重试耗尽后调用 :func:`finalize_once` 与接收端核对 deliveryId 最终去向
+（accepted/closed），核对不到明确结论时保持非终态，避免“发送端判失败、
+接收端稍后接纳”的两端不一致。
 """
 
 from __future__ import annotations
@@ -31,6 +35,22 @@ class DeliveryResult:
     http_status: Optional[int]
     detail: str
     duplicate: bool = False
+
+
+@dataclass
+class FinalizeResult:
+    """终态核对结果。
+
+    * ``accepted`` —— 接收端确认已接纳该 deliveryId，发送端应置 delivered；
+    * ``closed``   —— 接收端确认未接纳且已关闭该 deliveryId（迟到投递将被拒），
+      发送端应置 failed；
+    * ``unknown``  —— 核对本身未获响应（超时/断连/非预期响应），发送端必须
+      保持非终态并稍后重新核对，绝不能据此判定终态。
+    """
+
+    outcome: str  # accepted | closed | unknown
+    http_status: Optional[int]
+    detail: str
 
 
 def deliver_once(
@@ -97,6 +117,64 @@ def _parse_response(raw: bytes) -> Tuple[str, bool]:
     if isinstance(payload, dict):
         return str(payload.get("message", payload)), bool(payload.get("duplicate"))
     return str(payload), False
+
+
+def finalize_once(
+    host: str,
+    port: int,
+    path: str,
+    body: bytes,
+    alert_id: str,
+    delivery_id: str,
+    signature: str,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> FinalizeResult:
+    """向接收端核对某 deliveryId 的最终去向（单次请求，不做重试）。
+
+    只有拿到接收端明确的 accepted/closed 应答才可判定终态；其余一切情况
+    （超时、断连、4xx/5xx、响应无法解析）都返回 ``unknown``，由调用方保持
+    非终态并稍后重试。
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        "X-Alert-Id": alert_id,
+        "X-Delivery-Id": delivery_id,
+        "X-Signature": signature,
+    }
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+        except (socket.timeout, TimeoutError):
+            return FinalizeResult("unknown", None, "终态核对等待响应超时")
+        except (ConnectionError, socket.gaierror, OSError) as exc:
+            return FinalizeResult(
+                "unknown", None, f"终态核对连接中断: {type(exc).__name__}: {exc}"
+            )
+
+        status = resp.status
+        raw = resp.read(4096)
+        if 200 <= status < 300:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                outcome = payload.get("outcome") if isinstance(payload, dict) else None
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                outcome = None
+            if outcome in ("accepted", "closed"):
+                message = ""
+                if isinstance(payload, dict):
+                    message = str(payload.get("message", ""))
+                return FinalizeResult(outcome, status, message or f"接收端确认 {outcome}")
+            return FinalizeResult(
+                "unknown", status, f"终态核对响应无法识别: {raw[:200]!r}"
+            )
+        return FinalizeResult(
+            "unknown", status, f"终态核对收到非预期状态码 {status}"
+        )
+    finally:
+        conn.close()
 
 
 class RetryPolicy:

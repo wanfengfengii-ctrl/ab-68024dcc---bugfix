@@ -4,7 +4,11 @@
 1. 校验共享密钥签名（HMAC-SHA256），签名不符返回 401（不可重试）；
 2. 以 deliveryId 为幂等键落库：重复投递原样返回“已接纳”，同 deliveryId
    不同请求体返回 409（篡改检测）；进程重启后去重表仍然有效；
-3. 通过 /admin/faults 注入网络/服务故障，供冒烟测试验证重试与收敛：
+3. 终态核对接口 POST /gateway/alerts/finalize：发送端重试耗尽后来核对
+   deliveryId 最终去向——已接纳则答 accepted；否则原子写入关闭墓碑并答
+   closed，此后该 deliveryId 的迟到接纳请求一律拒绝（410）。该接口是
+   可靠性通道，不受故障注入影响，保证两端终态总能收敛一致；
+4. 通过 /admin/faults 注入网络/服务故障，供冒烟测试验证重试与收敛：
    - http_error: 前 N 次请求返回指定状态码（默认 503，可重试）
    - always:    始终返回指定状态码（默认 404，演示 4xx 立即失败）
    - drop_before_accept: 前 N 次直接断开连接（尚未接纳）
@@ -29,6 +33,7 @@ from .signing import signature_valid
 from .store import ReceiverStore
 
 DELIVERIES_PATH = "/gateway/alerts"
+FINALIZE_PATH = "/gateway/alerts/finalize"
 
 
 class FaultController:
@@ -130,7 +135,14 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
                             "acceptedAt": d["accepted_at"],
                         }
                         for d in store.list_deliveries()
-                    ]
+                    ],
+                    "closed": [
+                        {
+                            "deliveryId": c["delivery_id"],
+                            "closedAt": c["closed_at"],
+                        }
+                        for c in store.list_closed()
+                    ],
                 })
                 return
             self._send_json(404, {"error": "not found"})
@@ -143,6 +155,16 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
             if self.path == "/admin/reset":
                 store.reset()
                 self._send_json(200, {"message": "已清空接纳记录"})
+                return
+            if self.path == FINALIZE_PATH:
+                # 终态核对是可靠性通道：不走故障注入，保证两端总能收敛。
+                try:
+                    self._handle_finalize()
+                except (sqlite3.Error, OSError):
+                    try:
+                        self._drop()
+                    except OSError:
+                        pass
                 return
             if self.path != DELIVERIES_PATH:
                 self._send_json(404, {"error": "not found"})
@@ -170,6 +192,62 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
                 self._send_json(200, {"message": "故障脚本已设置", **faults.snapshot()})
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._send_json(400, {"error": f"故障配置无效: {exc}"})
+
+        def _handle_finalize(self) -> None:
+            """终态核对：与发送端约定 deliveryId 的最终去向。
+
+            已接纳 → accepted；未接纳 → 原子写入关闭墓碑后答 closed。
+            应答 closed 之后，该 deliveryId 的迟到投递一律拒绝（见
+            ``ReceiverStore.admit``），两端终态因此必然一致。
+            """
+            delivery_id = self.headers.get("X-Delivery-Id", "")
+            alert_id = self.headers.get("X-Alert-Id", "")
+            signature = self.headers.get("X-Signature", "")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json(400, {"error": "Content-Length 无效"})
+                return
+            body = self.rfile.read(length)
+
+            if not delivery_id:
+                self._send_json(400, {"error": "缺少 X-Delivery-Id 头"})
+                return
+            if not signature_valid(secret, delivery_id, body, signature):
+                self._send_json(401, {"error": "签名校验失败"})
+                return
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                assert isinstance(payload, dict)
+            except (json.JSONDecodeError, UnicodeDecodeError, AssertionError):
+                self._send_json(400, {"error": "请求体不是合法 JSON 对象"})
+                return
+            if payload.get("deliveryId") not in (None, delivery_id):
+                self._send_json(400, {"error": "请求体与头部 deliveryId 不一致"})
+                return
+
+            outcome = store.finalize(delivery_id)
+            if outcome == "accepted":
+                self._send_json(
+                    200,
+                    {
+                        "outcome": "accepted",
+                        "deliveryId": delivery_id,
+                        "alertId": alert_id,
+                        "message": "该 deliveryId 已被接纳，发送端应置 delivered",
+                    },
+                )
+            else:
+                self._send_json(
+                    200,
+                    {
+                        "outcome": "closed",
+                        "deliveryId": delivery_id,
+                        "alertId": alert_id,
+                        "message": "该 deliveryId 未被接纳，现已关闭；"
+                                   "迟到投递将被拒绝，发送端应置 failed",
+                    },
+                )
 
         def _handle_delivery(self) -> None:
             delivery_id = self.headers.get("X-Delivery-Id", "")
@@ -235,6 +313,16 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
                         "message": "该 deliveryId 此前已接纳，本次为幂等重放",
                         "deliveryId": delivery_id,
                         "duplicate": True,
+                    },
+                )
+            elif mode == "closed":
+                # 发送端已完成终态核对并判定失败：拒绝迟到接纳，
+                # 保证“API 最终 failed 的投递绝不被接收端接纳”。
+                self._send_json(
+                    410,
+                    {
+                        "error": "该 deliveryId 已经终态核对关闭，拒绝迟到接纳",
+                        "deliveryId": delivery_id,
                     },
                 )
             else:

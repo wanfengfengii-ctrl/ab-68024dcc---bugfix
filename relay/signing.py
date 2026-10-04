@@ -82,6 +82,20 @@ def sign(secret: str, delivery_id: str, body: bytes) -> str:
     return SIGNATURE_PREFIX + mac.hexdigest()
 
 
+def finalize_body(delivery_id: str, alert_id: str) -> bytes:
+    """终态核对（finalize）请求的规范化请求体。
+
+    与投递共用同一套签名规则：``sign(secret, delivery_id, finalize_body(...))``，
+    接收端据此确认核对请求确实来自持有共享密钥的发送端。
+    """
+    return json.dumps(
+        {"alertId": alert_id, "deliveryId": delivery_id},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 def signature_valid(secret: str, delivery_id: str, body: bytes, signature: str) -> bool:
     """常量时间比较，校验接收端收到的签名。"""
     if not signature:

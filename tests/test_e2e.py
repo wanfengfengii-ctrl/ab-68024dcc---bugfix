@@ -116,6 +116,67 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(view["attempts"], 4)
         self.assertIn("重试耗尽", view["failureReason"])
         self.assertIn("最终失败", view["conclusion"])
+        # 终态核对后接收端确认未接纳：该 deliveryId 应被关闭且从未被接纳
+        ids = [d["deliveryId"]
+               for d in client.get_json(f"{self.h.admin_base}/admin/deliveries")[1]["deliveries"]]
+        self.assertNotIn(r["deliveryId"], ids)
+
+    def test_late_accept_after_all_timeouts_converges_delivered(self):
+        # 连续 4 次各延迟 2s（客户端 1s 超时）：4 次尝试全部超时后，接收端
+        # 挂起的处理线程仍会醒来接纳该 deliveryId。发送端重试耗尽后必须先
+        # 与接收端核对终态，最终收敛为 delivered 且接收端只接纳一次。
+        client.set_fault(self.h.admin_base, "stall", count=4, seconds=2)
+        s, r = client.post_alert(self.h.api_base, make_alert("late-accept"))
+        self.assertEqual(s, 201)
+        view = client.poll_alert(self.h.api_base, r["alertId"],
+                                 lambda v: v["status"] == "delivered",
+                                 timeout=30)
+        self.assertEqual(view["attempts"], 4)
+        self.assertIn("唯一接纳", view["conclusion"])
+        ids = [d["deliveryId"]
+               for d in client.get_json(f"{self.h.admin_base}/admin/deliveries")[1]["deliveries"]]
+        self.assertEqual(ids.count(r["deliveryId"]), 1)
+
+    def test_exhausted_timeouts_close_delivery_and_reject_late(self):
+        # 4 次全部超时且接收端迟迟不处理（stall 6s 晚于核对时刻）：
+        # 核对判定未接纳 → failed；接收端随后醒来的迟到投递必须被拒绝，
+        # 两端终态保持“failed 且从未接纳”。
+        client.set_fault(self.h.admin_base, "stall", count=4, seconds=6)
+        s, r = client.post_alert(self.h.api_base, make_alert("late-reject"))
+        self.assertEqual(s, 201)
+        view = client.poll_alert(self.h.api_base, r["alertId"],
+                                 lambda v: v["status"] == "failed",
+                                 timeout=30)
+        self.assertEqual(view["attempts"], 4)
+        self.assertIn("重试耗尽", view["failureReason"])
+        # 等接收端 4 个被挂起的处理线程全部醒来（最晚约 6+4+1=11s）
+        time.sleep(11)
+        _, view2 = client.get_alert(self.h.api_base, r["alertId"])
+        self.assertEqual(view2["status"], "failed")
+        body = client.get_json(f"{self.h.admin_base}/admin/deliveries")[1]
+        ids = [d["deliveryId"] for d in body["deliveries"]]
+        closed = [c["deliveryId"] for c in body["closed"]]
+        self.assertNotIn(r["deliveryId"], ids, "已判 failed 的投递不得被接纳")
+        self.assertIn(r["deliveryId"], closed, "接收端应关闭该 deliveryId")
+
+    def test_restart_recovers_confirming_and_finalizes(self):
+        # 重试耗尽进入 confirming 后重启 API：新进程必须恢复核对流程，
+        # 与接收端核对后写入终态（此处接收端从未见到该投递 → failed）。
+        self.h.pool.stop()
+        s, r = client.post_alert(self.h.api_base, make_alert("confirm-restart"))
+        self.assertEqual(s, 201)
+        # 直接驱动存储：4 次失败尝试后转入 confirming（模拟耗尽瞬间崩溃）
+        store = self.h.api_store
+        for _ in range(4):
+            self.assertIsNotNone(store.begin_attempt(r["alertId"]))
+        self.assertTrue(store.mark_confirming(r["alertId"]))
+        self.h.restart_api()
+        view = client.poll_alert(self.h.api_base, r["alertId"],
+                                 lambda v: v["status"] == "failed",
+                                 timeout=30)
+        self.assertEqual(view["attempts"], 4)
+        self.assertIn("重试耗尽", view["failureReason"])
+        self.assertEqual(client.delivery_count(self.h.admin_base), 0)
 
     def test_restart_during_delivery_converges(self):
         # 用 stall 制造一次长时间在途投递（客户端 1s 超时、对端处理 10s）。

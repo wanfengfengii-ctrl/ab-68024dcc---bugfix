@@ -5,7 +5,13 @@ GET  /api/alerts/{id}    值班员查询：状态、尝试次数、最近结果�
 GET  /health             健康检查
 
 投递由进程内 worker 池执行：每次尝试用受理时入库的同一 body/deliveryId/
-签名；pending/delivering 记录在服务重启后自动恢复，凭接收端幂等收敛。
+签名；pending/delivering/confirming 记录在服务重启后自动恢复。
+
+终态一致性：重试耗尽后不直接判 failed，而是先转入 confirming 并向接收端
+发起终态核对（finalize）——接收端确认已接纳则置 delivered；接收端确认
+未接纳并关闭该 deliveryId（迟到投递将被拒）才置 failed；核对本身不可达
+则保持 confirming 稍后重核。由此杜绝“API 最终失败、接收端已经接纳”的
+两端不一致。
 """
 
 from __future__ import annotations
@@ -28,9 +34,11 @@ from .httpclient import (
     DEFAULT_TIMEOUT,
     RetryPolicy,
     deliver_once,
+    finalize_once,
 )
-from .signing import canonical_body, sign, validate_alert_payload
+from .signing import canonical_body, finalize_body, sign, validate_alert_payload
 from .store import (
+    STATUS_CONFIRMING,
     STATUS_DELIVERED,
     STATUS_FAILED,
     AlertStore,
@@ -42,6 +50,7 @@ class Config:
     receiver_host: str = "receiver"
     receiver_port: int = 8081
     receiver_path: str = "/gateway/alerts"
+    receiver_finalize_path: str = "/gateway/alerts/finalize"
     secret: str = "earthquake-relay-secret"
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     timeout: float = DEFAULT_TIMEOUT
@@ -55,6 +64,9 @@ class Config:
             receiver_host=os.getenv("RECEIVER_HOST", "receiver"),
             receiver_port=int(os.getenv("RECEIVER_PORT", "8081")),
             receiver_path=os.getenv("RECEIVER_PATH", "/gateway/alerts"),
+            receiver_finalize_path=os.getenv(
+                "RECEIVER_FINALIZE_PATH", "/gateway/alerts/finalize"
+            ),
             secret=os.getenv("SHARED_SECRET", "earthquake-relay-secret"),
             max_attempts=int(os.getenv("MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))),
             timeout=float(os.getenv("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT))),
@@ -140,18 +152,20 @@ class DeliveryPool:
                 return
             if row["status"] in (STATUS_DELIVERED, STATUS_FAILED):
                 return
-            attempts = int(row["attempts"])
-            if attempts >= self.cfg.max_attempts:
-                self.store.finish(
-                    alert_id,
-                    STATUS_FAILED,
-                    f"重试耗尽：{attempts} 次尝试后接收端仍未确认接纳",
-                )
+            if (
+                row["status"] == STATUS_CONFIRMING
+                or int(row["attempts"]) >= self.cfg.max_attempts
+            ):
+                # 重试耗尽（或重启恢复到的待核对记录）：先与接收端核对
+                # deliveryId 最终去向，再据核对结论写终态；核对不到明确
+                # 结论时保持非终态，交给兜底扫描稍后重核。
+                if not self._finalize(alert_id, row):
+                    self.store.mark_confirming(alert_id)
                 return
 
             attempt_no = self.store.begin_attempt(alert_id)
             if attempt_no is None:
-                return  # 已被其他流程置为终态
+                return  # 已被其他流程置为终态或转入核对
             result = deliver_once(
                 host=self.cfg.receiver_host,
                 port=self.cfg.receiver_port,
@@ -186,15 +200,60 @@ class DeliveryPool:
                 )
                 return
             if attempt_no >= self.cfg.max_attempts:
-                self.store.finish(
-                    alert_id,
-                    STATUS_FAILED,
-                    f"重试耗尽：已尝试 {attempt_no} 次（超时/断连/5xx），"
-                    f"接收端未确认接纳；最近结果：{result.detail}",
-                )
-                return
+                # 最后一次尝试结果未知（超时/断连/5xx）：接收端仍可能
+                # 稍后接纳（如 stall 醒来的处理线程），不能直接判失败，
+                # 转入 confirming 并立即发起终态核对。
+                self.store.mark_confirming(alert_id)
+                continue
             if self._stop.wait(self.policy.backoff(attempt_no)):
                 return
+
+    def _finalize(self, alert_id: str, row: Dict[str, Any]) -> bool:
+        """与接收端核对 deliveryId 的最终去向。返回 True 表示已写入终态。
+
+        * accepted → delivered（接收端确实接纳了该投递）；
+        * closed   → failed（接收端确认未接纳，且已关闭该 deliveryId，
+          此后迟到的投递请求会被接收端拒绝，两端终态一致）；
+        * unknown  → 不写终态，保持 confirming 等待重核——宁可暂不结论，
+          也不留下“API 最终失败、接收端已经接纳”的不一致组合。
+        """
+        self.store.mark_confirming(alert_id)
+        body = finalize_body(row["delivery_id"], alert_id)
+        signature = sign(self.cfg.secret, row["delivery_id"], body)
+        result = finalize_once(
+            host=self.cfg.receiver_host,
+            port=self.cfg.receiver_port,
+            path=self.cfg.receiver_finalize_path,
+            body=body,
+            alert_id=alert_id,
+            delivery_id=row["delivery_id"],
+            signature=signature,
+            timeout=self.cfg.timeout,
+        )
+        # 停止流程中不写状态，交由新进程重新核对。
+        if self._stop.is_set():
+            return False
+        self.store.record_attempt(
+            alert_id,
+            int(row["attempts"]),
+            result.http_status,
+            f"finalize-{result.outcome}",
+            result.detail,
+        )
+        if result.outcome == "accepted":
+            self.store.finish(alert_id, STATUS_DELIVERED)
+            return True
+        if result.outcome == "closed":
+            attempts = int(row["attempts"])
+            self.store.finish(
+                alert_id,
+                STATUS_FAILED,
+                f"重试耗尽：已尝试 {attempts} 次（超时/断连/5xx），"
+                f"接收端未确认接纳；经终态核对，该 deliveryId 未被接纳"
+                f"且已在接收端关闭，迟到投递将被拒绝",
+            )
+            return True
+        return False
 
 
 def status_view(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -206,6 +265,9 @@ def status_view(row: Dict[str, Any]) -> Dict[str, Any]:
     elif status == STATUS_FAILED:
         conclusion = f"❌ 最终失败：{row.get('failure_reason') or row.get('last_result')}"
         terminal = True
+    elif status == STATUS_CONFIRMING:
+        conclusion = "⏳ 投递重试已耗尽，正在与接收端核对最终去向（非终态）"
+        terminal = False
     elif status == "delivering":
         conclusion = "⏳ 正在投递，已开始尝试，尚未得到接收端确认"
         terminal = False
