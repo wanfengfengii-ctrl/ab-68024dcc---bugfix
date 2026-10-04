@@ -159,6 +159,81 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(view["status"], "delivered")
         self.assertEqual(view["attempts"], 1)
 
+    def test_four_timeouts_late_accept_converges_delivered(self):
+        # 题述场景：四次投递都在超时后才被接收端慢处理接纳。
+        # 每次 stall 2s（>1s 客户端超时），首个慢线程在第 2 秒已接纳，
+        # 四次投递约 4s 用尽后终态核对必须确认“已接纳”并收敛 delivered。
+        client.set_fault(self.h.admin_base, "stall", count=4, seconds=2)
+        s, r = client.post_alert(self.h.api_base, make_alert("late-accept"))
+        self.assertEqual(s, 201)
+        view = client.poll_alert(
+            self.h.api_base, r["alertId"],
+            lambda v: v["terminal"] is True, timeout=20,
+        )
+        self.assertEqual(view["status"], "delivered")
+        self.assertEqual(view["attempts"], 4)
+        # 等待所有慢处理线程醒来（均为幂等重放，不重复接纳）
+        time.sleep(7)
+        ids = [d["deliveryId"]
+               for d in client.get_json(f"{self.h.admin_base}/admin/deliveries")[1]["deliveries"]]
+        self.assertEqual(ids.count(r["deliveryId"]), 1)
+        _, still = client.get_alert(self.h.api_base, r["alertId"])
+        self.assertEqual(still["status"], "delivered")
+
+    def test_four_unknown_sealed_then_late_post_rejected(self):
+        # 反向竞态：四次超时仅约 4s，慢线程 8s 后才醒来。终态核对先封存，
+        # API 判 failed；此后醒来的同 deliveryId 投递必须被 410 拒绝。
+        client.set_fault(self.h.admin_base, "stall", count=4, seconds=8)
+        s, r = client.post_alert(self.h.api_base, make_alert("seal-race"))
+        self.assertEqual(s, 201)
+        view = client.poll_alert(
+            self.h.api_base, r["alertId"],
+            lambda v: v["terminal"] is True, timeout=15,
+        )
+        self.assertEqual(view["status"], "failed")
+        self.assertEqual(view["attempts"], 4)
+        self.assertIn("终态核对", view["failureReason"])
+        # 等全部慢线程醒来尝试接纳
+        time.sleep(9)
+        deliveries = client.get_json(
+            f"{self.h.admin_base}/admin/deliveries")[1]["deliveries"]
+        rec = {d["deliveryId"]: d for d in deliveries}[r["deliveryId"]]
+        self.assertTrue(rec["sealed"])
+        _, still = client.get_alert(self.h.api_base, r["alertId"])
+        self.assertEqual(still["status"], "failed")
+
+    def test_resolve_unreachable_keeps_nonterminal_then_settles(self):
+        # 核对期间接收端宕机：四次投递用尽也不得判终态；
+        # API 重启后继续核对；接收端带着持久化库恢复后收敛封存判失败，
+        # 接收端再重启封存仍在。
+        self.h.stop_receiver()
+        s, r = client.post_alert(self.h.api_base, make_alert("recon-down"))
+        self.assertEqual(s, 201)
+        client.poll_alert(
+            self.h.api_base, r["alertId"],
+            lambda v: v["status"] == "delivering" and v["attempts"] == 4,
+            timeout=10,
+        )
+        for _ in range(10):
+            _, v = client.get_alert(self.h.api_base, r["alertId"])
+            self.assertEqual(v["status"], "delivering")
+            time.sleep(0.1)
+        self.h.restart_api()
+        time.sleep(0.5)
+        _, v = client.get_alert(self.h.api_base, r["alertId"])
+        self.assertEqual(v["status"], "delivering")
+        self.h.restart_receiver()
+        view = client.poll_alert(
+            self.h.api_base, r["alertId"],
+            lambda x: x["terminal"] is True, timeout=15,
+        )
+        self.assertEqual(view["status"], "failed")
+        self.h.restart_receiver()
+        deliveries = client.get_json(
+            f"{self.h.admin_base}/admin/deliveries")[1]["deliveries"]
+        rec = {d["deliveryId"]: d for d in deliveries}[r["deliveryId"]]
+        self.assertTrue(rec["sealed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ cp .env.example .env
 
 docker compose up -d --build
 
-# 一键验证（退出码 0 表示构建检查、21 项代码测试、8 个投递冒烟全部通过）
+# 一键验证（退出码 0 表示构建检查、26 项代码测试、10 个投递冒烟全部通过）
 docker compose run --rm verify
 echo $?
 
@@ -50,7 +50,8 @@ API_HOST_PORT=18080 docker compose up -d
 尝试次数、`lastResult`/`lastHttpStatus` 最近结果，并给值班员一句明确结论：
 
 * 成功：`✅ 告警已被应急广播网关唯一接纳（deliveryId 幂等确认）`
-* 失败：`❌ 最终失败：重试耗尽…` 或 `❌ 最终失败：接收端返回不可重试响应（HTTP 4xx）…`
+* 失败：`❌ 最终失败：重试耗尽…终态核对确认接收端从未接纳并已封存…` 或 `❌ 最终失败：接收端返回不可重试响应（HTTP 4xx）…`
+* 四次投递用尽、终态核对进行中：仍为非终态 `delivering`，提示“正在与接收端进行终态核对”，绝不会先显示失败再改口。
 
 ## 可靠性设计（如何满足 exactly-once 收敛）
 
@@ -60,8 +61,9 @@ API_HOST_PORT=18080 docker compose up -d
 | 请求体被改动 | 请求体规范化（字段排序的 JSON）后算 SHA-256 指纹；首次受理时用共享密钥生成 HMAC-SHA256 签名并**入库一次**，之后每次重试原样重放完全相同的 body/deliveryId/签名。 |
 | 网络闪断/超时/5xx | 视为结果未知并重试：首次尝试 + 最多 3 次重试（共 4 次），指数退避。 |
 | 对方已接纳后才断连 | 客户端只看到断连，重试命中接收端幂等记录，`delivered` 收敛且只接纳一次。 |
+| 四次投递全部超时/断连，结果仍未知 | **不提前判失败**，转入与接收端的原子终态核对 `POST /gateway/deliveries/resolve`：已接纳则收敛 `delivered`；确认从未接纳则由接收端**封存该 deliveryId**（迟到的同 deliveryId 投递一律 `410`，永不接纳），此时才判 `failed`；核对端点本身不可达则保持非终态并持续核对（同样可经进程重启恢复）。 |
 | 4xx（如签名不符 401、未找到 404） | 不可重试，**立即 failed**，`attempts=1`。 |
-| 发送进程重启/崩溃 | 非终态（pending/delivering）记录在启动时全部恢复；终态不可被改写。接收端去重表也持久化，跨重启仍只接纳一次。 |
+| 发送进程重启/崩溃 | 非终态（pending/delivering）记录在启动时全部恢复；终态不可被改写。接收端去重表（含封存记录）也持久化，跨重启仍只接纳一次 / 永不接纳。 |
 | 并发重复提交 | 受理事务 `BEGIN IMMEDIATE` + `alert_key UNIQUE`；投递池单飞去重，周期兜底扫描卡死记录。 |
 
 ## 接收模拟器
@@ -78,18 +80,25 @@ curl -sX POST localhost:8081/admin/faults -H 'Content-Type: application/json' \
 # 支持：ok / always(默认404) / http_error / drop_before_accept / drop_after_accept / stall
 ```
 
+投递路径之外另有内部终态核对接口 `POST /gateway/deliveries/resolve`（由发送端在
+四次投递用尽后自动调用，不经过故障注入）：已接纳返回
+`{"outcome":"accepted"}`；从未接纳则当场封存并返回 `{"outcome":"sealed"}`，
+此后同 `deliveryId` 的投递恒为 `410`。`GET /admin/deliveries` 的每条记录带
+`state`（`accepted`/`sealed`）与 `sealed` 布尔字段，供验收按 `deliveryId`
+核对两端终态。
+
 ## 目录结构
 
 ```
 relay/
   signing.py     规范化、指纹、HMAC-SHA256 签名与校验
-  store.py       AlertStore（告警/尝试审计）、ReceiverStore（deliveryId 去重）
-  httpclient.py  投递结果分类（accepted/unretryable/retryable）与退避策略
-  api.py         POST/GET API + 投递 worker 池 + 重启恢复
-  receiver.py    应急广播网关接收模拟器（验签、幂等、故障注入）
-  scenarios.py   8 个端到端冒烟场景
+  store.py       AlertStore（告警/尝试/核对审计）、ReceiverStore（deliveryId 去重与封存）
+  httpclient.py  投递结果分类（accepted/unretryable/retryable）、终态核对与退避策略
+  api.py         POST/GET API + 投递 worker 池 + 耗尽后终态核对 + 重启恢复
+  receiver.py    应急广播网关接收模拟器（验签、幂等、封存核对、故障注入）
+  scenarios.py   10 个端到端冒烟场景
   client.py      冒烟/测试共用 HTTP 工具
-tests/           21 个单元与端到端测试（含真实进程重启恢复）
+tests/           26 个单元与端到端测试（含真实进程重启恢复与迟到接纳竞态）
 scripts/verify.py 一次性 verify：构建检查 + 单测 + 冒烟，位掩码退出码
 Dockerfile / docker-compose.yml / .env.example
 ```
@@ -97,7 +106,7 @@ Dockerfile / docker-compose.yml / .env.example
 ## 本地开发（无 Docker）
 
 ```bash
-python3 -m unittest discover -s tests -v          # 21 项测试
+python3 -m unittest discover -s tests -v          # 26 项测试
 python3 -m relay.receiver --port 8081 --db /tmp/r.db --secret dev
 RECEIVER_HOST=127.0.0.1 RECEIVER_PORT=8081 SHARED_SECRET=dev \
   python3 -m relay.api --port 8080 --db /tmp/a.db

@@ -18,19 +18,14 @@ class LocalHarness:
     def __init__(self, *, backoff_base: float = 0.01, timeout: float = 1.0) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="relay-test-"))
         self.faults = FaultController()
-        self.receiver_store = ReceiverStore(str(self.tmp / "receiver.db"))
-        self.receiver = create_receiver_server(
-            "127.0.0.1", 0, self.receiver_store, SECRET, self.faults
-        )
-        self._receiver_thread = threading.Thread(
-            target=self.receiver.serve_forever, daemon=True
-        )
-        self._receiver_thread.start()
-        self.receiver_port = self.receiver.server_address[1]
+        self.receiver_port = None
+        self.receiver_db = str(self.tmp / "receiver.db")
+        self.receiver_store: Optional[ReceiverStore] = None
+        self.receiver = None
 
         self.cfg = Config(
             receiver_host="127.0.0.1",
-            receiver_port=self.receiver_port,
+            receiver_port=0,  # start_receiver 后回填实际端口
             secret=SECRET,
             backoff_base=backoff_base,
             timeout=timeout,
@@ -41,7 +36,37 @@ class LocalHarness:
         self.api = None
         self.pool = None
         self.api_port = 0
+        self.start_receiver()
         self.start_api()
+
+    def start_receiver(self) -> None:
+        """启动（或用同一持久化库重启）接收模拟器。"""
+        self.faults = FaultController()
+        self.receiver_store = ReceiverStore(self.receiver_db)
+        self.receiver = create_receiver_server(
+            "127.0.0.1", self.receiver_port or 0,
+            self.receiver_store, SECRET, self.faults,
+        )
+        self._receiver_thread = threading.Thread(
+            target=self.receiver.serve_forever, daemon=True
+        )
+        self._receiver_thread.start()
+        self.receiver_port = self.receiver.server_address[1]
+        self.cfg.receiver_port = self.receiver_port
+
+    def stop_receiver(self) -> None:
+        """关闭接收模拟器但保留磁盘去重表（模拟网关宕机/重启）。"""
+        assert self.receiver and self.receiver_store
+        self.receiver.shutdown()
+        self.receiver.server_close()
+        self.receiver_store.close()
+        self.receiver = None
+        self.receiver_store = None
+
+    def restart_receiver(self) -> None:
+        if self.receiver is not None:
+            self.stop_receiver()
+        self.start_receiver()
 
     def start_api(self) -> None:
         self.api_store = AlertStore(str(self.tmp / "api.db"))
@@ -79,6 +104,5 @@ class LocalHarness:
     def stop(self) -> None:
         if self.api is not None:
             self.stop_api()
-        self.receiver.shutdown()
-        self.receiver.server_close()
-        self.receiver_store.close()
+        if self.receiver is not None:
+            self.stop_receiver()

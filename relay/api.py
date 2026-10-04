@@ -25,9 +25,12 @@ from typing import Any, Dict, List, Optional
 from .httpclient import (
     DEFAULT_BASE_DELAY,
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_RESOLVE_PATH,
     DEFAULT_TIMEOUT,
     RetryPolicy,
     deliver_once,
+    resolve_backoff_delay,
+    resolve_once,
 )
 from .signing import canonical_body, sign, validate_alert_payload
 from .store import (
@@ -42,6 +45,7 @@ class Config:
     receiver_host: str = "receiver"
     receiver_port: int = 8081
     receiver_path: str = "/gateway/alerts"
+    resolve_path: str = DEFAULT_RESOLVE_PATH
     secret: str = "earthquake-relay-secret"
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     timeout: float = DEFAULT_TIMEOUT
@@ -55,6 +59,7 @@ class Config:
             receiver_host=os.getenv("RECEIVER_HOST", "receiver"),
             receiver_port=int(os.getenv("RECEIVER_PORT", "8081")),
             receiver_path=os.getenv("RECEIVER_PATH", "/gateway/alerts"),
+            resolve_path=os.getenv("RESOLVE_PATH", DEFAULT_RESOLVE_PATH),
             secret=os.getenv("SHARED_SECRET", "earthquake-relay-secret"),
             max_attempts=int(os.getenv("MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS))),
             timeout=float(os.getenv("REQUEST_TIMEOUT", str(DEFAULT_TIMEOUT))),
@@ -142,11 +147,9 @@ class DeliveryPool:
                 return
             attempts = int(row["attempts"])
             if attempts >= self.cfg.max_attempts:
-                self.store.finish(
-                    alert_id,
-                    STATUS_FAILED,
-                    f"重试耗尽：{attempts} 次尝试后接收端仍未确认接纳",
-                )
+                # 投递次数已用尽且结论仍未知：不能判失败（接收端可能正在慢处理
+                # 并稍后接纳），转入终态核对直到达成两端一致的确定结论。
+                self._reconcile_until_settled(alert_id)
                 return
 
             attempt_no = self.store.begin_attempt(alert_id)
@@ -186,18 +189,62 @@ class DeliveryPool:
                 )
                 return
             if attempt_no >= self.cfg.max_attempts:
-                self.store.finish(
-                    alert_id,
-                    STATUS_FAILED,
-                    f"重试耗尽：已尝试 {attempt_no} 次（超时/断连/5xx），"
-                    f"接收端未确认接纳；最近结果：{result.detail}",
-                )
+                # 四次投递全部是“结果未知”（超时/断连/5xx）：转入终态核对，
+                # 绝不允许停留在“API 判失败、接收端稍后仍接纳”的组合。
+                self._reconcile_until_settled(alert_id)
                 return
             if self._stop.wait(self.policy.backoff(attempt_no)):
                 return
 
+    def _reconcile_until_settled(self, alert_id: str) -> None:
+        """投递用尽后与接收端反复做原子终态核对，直到结论确定。
 
-def status_view(row: Dict[str, Any]) -> Dict[str, Any]:
+        * 接收端确已接纳        -> delivered；
+        * 接收端封存（永不接纳）-> failed；
+        * 核对本身仍超时/断连   -> 保持 delivering 继续核对。该状态随 SQLite
+          持久化，进程重启后由恢复扫描重新进入本循环，不会长期悬而未决，也
+          不会在未取得确定结论前提前判失败。
+        """
+        round_no = 0
+        while not self._stop.is_set():
+            row = self.store.get(alert_id)
+            if row is None or row["status"] in (STATUS_DELIVERED, STATUS_FAILED):
+                return
+            round_no += 1
+            result = resolve_once(
+                host=self.cfg.receiver_host,
+                port=self.cfg.receiver_port,
+                path=self.cfg.resolve_path,
+                alert_id=alert_id,
+                delivery_id=row["delivery_id"],
+                secret=self.cfg.secret,
+                timeout=self.cfg.timeout,
+            )
+            if self._stop.is_set():
+                return
+            self.store.record_resolve(
+                alert_id, round_no, result.http_status,
+                result.outcome, result.detail,
+            )
+
+            if result.outcome == "accepted":
+                self.store.finish(alert_id, STATUS_DELIVERED)
+                return
+            if result.outcome == "sealed":
+                self.store.finish(
+                    alert_id,
+                    STATUS_FAILED,
+                    f"重试耗尽：{self.cfg.max_attempts} 次投递均未得到确认，"
+                    f"终态核对确认接收端从未接纳并已封存该 deliveryId"
+                    f"（此后永不接纳）；最近结果：{result.detail}",
+                )
+                return
+            # outcome == "unknown"：结论仍未定，退避后继续核对。
+            if self._stop.wait(resolve_backoff_delay(round_no, self.cfg.backoff_base)):
+                return
+
+
+def status_view(row: Dict[str, Any], max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> Dict[str, Any]:
     """值班员视图：除机器字段外给出明确的人类可读结论。"""
     status = row["status"]
     if status == STATUS_DELIVERED:
@@ -207,7 +254,13 @@ def status_view(row: Dict[str, Any]) -> Dict[str, Any]:
         conclusion = f"❌ 最终失败：{row.get('failure_reason') or row.get('last_result')}"
         terminal = True
     elif status == "delivering":
-        conclusion = "⏳ 正在投递，已开始尝试，尚未得到接收端确认"
+        if int(row.get("attempts") or 0) >= max_attempts:
+            conclusion = (
+                "⏳ 投递次数已用尽且结果未知，正在与接收端进行终态核对"
+                "（已接纳则收敛为送达，确认从未接纳才会判失败）"
+            )
+        else:
+            conclusion = "⏳ 正在投递，已开始尝试，尚未得到接收端确认"
         terminal = False
     else:
         conclusion = "⏳ 已受理，等待投递"
@@ -253,7 +306,7 @@ def build_handler(store: AlertStore, cfg: Config, pool: Optional[DeliveryPool] =
                 if row is None:
                     self._send_json(404, {"error": "告警不存在", "alertId": alert_id})
                     return
-                self._send_json(200, status_view(row))
+                self._send_json(200, status_view(row, cfg.max_attempts))
                 return
             self._send_json(404, {"error": "not found"})
 

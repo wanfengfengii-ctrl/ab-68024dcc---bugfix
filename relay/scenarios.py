@@ -58,6 +58,12 @@ def _receiver_delivery_ids(admin: str) -> List[str]:
     return [d["deliveryId"] for d in body["deliveries"]]
 
 
+def _receiver_delivery_records(admin: str) -> List[Dict[str, Any]]:
+    status, body = client.get_json(f"{admin}/admin/deliveries")
+    assert status == 200, f"读取接收端接纳记录失败: {body}"
+    return list(body["deliveries"])
+
+
 def _post_and_poll(
     api: str, alert: Dict[str, Any], predicate: Callable[[Dict[str, Any]], bool],
     timeout: float = 40.0,
@@ -177,9 +183,14 @@ def scenario_retries_exhausted(api: str, admin: str) -> SmokeResult:
         client.set_fault(admin, "ok")
     assert view["attempts"] == 4, f"首次+3 次重试应=4，实际 {view['attempts']}"
     assert "重试耗尽" in (view.get("failureReason") or ""), view.get("failureReason")
+    assert "终态核对" in (view.get("failureReason") or ""), view.get("failureReason")
     assert "最终失败" in view["conclusion"]
-    return SmokeResult("持续 5xx：重试三次后耗尽并明确最终失败", True,
-                       f"attempts=4, reason={view['failureReason']}", view)
+    # 判失败的同时接收端必须已封存该 deliveryId（此后永不接纳）
+    recs = {d["deliveryId"]: d for d in _receiver_delivery_records(admin)}
+    assert view["deliveryId"] in recs and recs[view["deliveryId"]]["sealed"], \
+        "判失败后接收端必须封存该 deliveryId"
+    return SmokeResult("持续 5xx：重试耗尽经终态核对封存后明确失败", True,
+                       f"attempts=4, 接收端=sealed, deliveryId={view['deliveryId']}", view)
 
 
 def scenario_timeout_then_ok(api: str, admin: str) -> SmokeResult:
@@ -195,6 +206,48 @@ def scenario_timeout_then_ok(api: str, admin: str) -> SmokeResult:
                        f"attempts=2, deliveryId={view['deliveryId']}", view)
 
 
+def scenario_four_timeouts_late_accept(api: str, admin: str) -> SmokeResult:
+    # 题述不一致场景：连续四次投递都在客户端超时后才被慢处理接纳。
+    # 四次投递用尽后进入终态核对：首个慢请求其实已接纳 -> 必须收敛
+    # delivered，而不是提前判 failed；其余慢请求均为幂等重放，仅接纳一次。
+    client.set_fault(admin, "stall", count=4, seconds=5)
+    try:
+        alert = _unique_alert()
+        view = _post_and_poll(api, alert, _terminal, timeout=40.0)
+    finally:
+        client.set_fault(admin, "ok")
+    assert view["status"] == "delivered", \
+        f"接收端已（迟到）接纳，终态核对后必须 delivered，实际 {view['status']}"
+    assert view["attempts"] == 4, f"四次均超时，应 attempts=4，实际 {view['attempts']}"
+    # 等最后的慢处理线程醒来，确认它们全部命中幂等而不是重复接纳
+    time.sleep(6)
+    recs = {d["deliveryId"]: d for d in _receiver_delivery_records(admin)}
+    assert view["deliveryId"] in recs, "接收端缺少该 deliveryId 接纳记录"
+    assert not recs[view["deliveryId"]]["sealed"], "已接纳记录不得被封存"
+    ids = [d["deliveryId"] for d in recs.values()]
+    assert ids.count(view["deliveryId"]) == 1, "迟到处理造成重复接纳"
+    return SmokeResult("四次超时后接收端迟到接纳：终态核对收敛 delivered 且仅接纳一次", True,
+                       f"attempts=4, 接收端=accepted, deliveryId={view['deliveryId']}", view)
+
+
+def scenario_unknown_exhausted_then_sealed(api: str, admin: str) -> SmokeResult:
+    # 四次投递都在接纳前断连（结果未知且永远不会接纳）：终态核对封存后判
+    # failed；该 deliveryId 此后在接收端永不接纳。
+    client.set_fault(admin, "drop_before_accept", count=4)
+    try:
+        alert = _unique_alert()
+        view = _post_and_poll(api, alert, _failed, timeout=30.0)
+    finally:
+        client.set_fault(admin, "ok")
+    assert view["attempts"] == 4, f"应 attempts=4，实际 {view['attempts']}"
+    assert "终态核对" in (view.get("failureReason") or ""), view.get("failureReason")
+    recs = {d["deliveryId"]: d for d in _receiver_delivery_records(admin)}
+    assert view["deliveryId"] in recs and recs[view["deliveryId"]]["sealed"], \
+        "判失败后接收端必须封存该 deliveryId"
+    return SmokeResult("四次结果未知且未接纳：封存后判失败，该投递永不被接纳", True,
+                       f"attempts=4, 接收端=sealed, deliveryId={view['deliveryId']}", view)
+
+
 SCENARIOS = [
     scenario_happy_path,
     scenario_replay,
@@ -204,6 +257,8 @@ SCENARIOS = [
     scenario_4xx_fatal,
     scenario_retries_exhausted,
     scenario_timeout_then_ok,
+    scenario_four_timeouts_late_accept,
+    scenario_unknown_exhausted_then_sealed,
 ]
 
 

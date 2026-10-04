@@ -24,6 +24,10 @@ STATUS_FAILED = "failed"
 TERMINAL_STATUSES = (STATUS_DELIVERED, STATUS_FAILED)
 ACTIVE_STATUSES = (STATUS_PENDING, STATUS_DELIVERING)
 
+# 接收端 deliveryId 记录状态：已接纳 / 已封存（终态核对确认永不接纳）
+STATE_ACCEPTED = "accepted"
+STATE_SEALED = "sealed"
+
 
 def _connect(path: str) -> sqlite3.Connection:
     if path != ":memory:":
@@ -67,6 +71,15 @@ class AlertStore:
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_id    TEXT NOT NULL,
                     attempt_no  INTEGER NOT NULL,
+                    http_status INTEGER,
+                    outcome     TEXT NOT NULL,
+                    detail      TEXT NOT NULL,
+                    at          REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS delivery_resolutions (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id    TEXT NOT NULL,
+                    round_no    INTEGER NOT NULL,
                     http_status INTEGER,
                     outcome     TEXT NOT NULL,
                     detail      TEXT NOT NULL,
@@ -211,6 +224,30 @@ class AlertStore:
                 (detail, http_status, now, alert_id),
             )
 
+    def record_resolve(
+        self,
+        alert_id: str,
+        round_no: int,
+        http_status: Optional[int],
+        outcome: str,
+        detail: str,
+    ) -> None:
+        """记录一轮终态核对并更新“最近结果”，同样不改变终态状态。"""
+        now = time.time()
+        with self._transaction() as conn:
+            conn.execute(
+                """INSERT INTO delivery_resolutions
+                   (alert_id, round_no, http_status, outcome, detail, at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (alert_id, round_no, http_status, outcome, detail, now),
+            )
+            conn.execute(
+                """UPDATE alerts
+                   SET last_result = ?, last_http_status = ?, updated_at = ?
+                   WHERE alert_id = ?""",
+                (f"[终态核对] {detail}", http_status, now, alert_id),
+            )
+
     def finish(
         self,
         alert_id: str,
@@ -278,16 +315,30 @@ class ReceiverStore:
                     delivery_id TEXT PRIMARY KEY,
                     alert_id    TEXT NOT NULL,
                     fingerprint TEXT NOT NULL,
+                    state       TEXT NOT NULL DEFAULT 'accepted',
                     accepted_at REAL NOT NULL
                 );
                 """
             )
+            # 旧版本库平滑升级：补齐封存状态列。
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(deliveries)").fetchall()
+            }
+            if "state" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'accepted'"
+                )
 
     def admit(
         self, delivery_id: str, alert_id: str, fingerprint: str
     ) -> str:
-        """返回 ``new`` / ``duplicate`` / ``tampered``。"""
-        now = time.time()
+        """返回 ``new`` / ``duplicate`` / ``tampered`` / ``sealed``。
+
+        ``sealed`` 表示该 deliveryId 已在终态核对中被确认“永不接纳”并封存：
+        这是迟到投递（发送端此前超时、对端处理更慢）必须被拒绝的情形，
+        从根本上排除“发送端最终失败、接收端却已接纳”的两端不一致。
+        """
         with self._lock:
             for attempt in range(5):
                 try:
@@ -299,10 +350,13 @@ class ReceiverStore:
                     time.sleep(0.05 * (attempt + 1))
             try:
                 row = self._conn.execute(
-                    "SELECT fingerprint FROM deliveries WHERE delivery_id = ?",
+                    "SELECT fingerprint, state FROM deliveries WHERE delivery_id = ?",
                     (delivery_id,),
                 ).fetchone()
                 if row is not None:
+                    if row["state"] == STATE_SEALED:
+                        self._conn.rollback()
+                        return "sealed"
                     mode = (
                         "duplicate"
                         if row["fingerprint"] == fingerprint
@@ -312,9 +366,9 @@ class ReceiverStore:
                     return mode
                 self._conn.execute(
                     """INSERT INTO deliveries
-                       (delivery_id, alert_id, fingerprint, accepted_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (delivery_id, alert_id, fingerprint, now),
+                       (delivery_id, alert_id, fingerprint, state, accepted_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (delivery_id, alert_id, fingerprint, STATE_ACCEPTED, time.time()),
                 )
                 self._conn.commit()
                 return "new"
@@ -322,9 +376,55 @@ class ReceiverStore:
                 self._conn.rollback()
                 raise
 
+    def resolve(self, delivery_id: str, alert_id: str) -> str:
+        """投递用尽后的原子终态核对（单次事务内完成）。
+
+        返回：
+        * ``accepted`` —— 该 deliveryId 此前已接纳（本次不改任何状态）；
+        * ``sealed``   —— 从未接纳：当场写入封存记录。封存持久化且不可逆，
+                          之后任何迟到的同 deliveryId 投递都被 :meth:`admit`
+                          拒绝（``sealed``），接收端永远不会在发送端判失败后
+                          再接纳它。
+
+        与“对端正在慢处理的迟到 POST”竞争时，数据库写锁 + 插入唯一约束保证
+        接纳与封存中只有一个会成功（见 :meth:`admit`）。
+        """
+        with self._lock:
+            for attempt in range(5):
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+            try:
+                row = self._conn.execute(
+                    "SELECT state FROM deliveries WHERE delivery_id = ?",
+                    (delivery_id,),
+                ).fetchone()
+                if row is not None:
+                    outcome = (
+                        "sealed" if row["state"] == STATE_SEALED else "accepted"
+                    )
+                    self._conn.rollback()
+                    return outcome
+                self._conn.execute(
+                    """INSERT INTO deliveries
+                       (delivery_id, alert_id, fingerprint, state, accepted_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    # 封存行没有请求体指纹，用空串占位；其 state 决定永不接纳。
+                    (delivery_id, alert_id, "", STATE_SEALED, time.time()),
+                )
+                self._conn.commit()
+                return "sealed"
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def list_deliveries(self) -> List[Dict[str, Any]]:
         cur = self._conn.execute(
-            "SELECT delivery_id, alert_id, accepted_at FROM deliveries "
+            "SELECT delivery_id, alert_id, state, accepted_at FROM deliveries "
             "ORDER BY accepted_at"
         )
         return [dict(r) for r in cur.fetchall()]

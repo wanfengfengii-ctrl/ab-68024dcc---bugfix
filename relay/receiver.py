@@ -4,7 +4,11 @@
 1. 校验共享密钥签名（HMAC-SHA256），签名不符返回 401（不可重试）；
 2. 以 deliveryId 为幂等键落库：重复投递原样返回“已接纳”，同 deliveryId
    不同请求体返回 409（篡改检测）；进程重启后去重表仍然有效；
-3. 通过 /admin/faults 注入网络/服务故障，供冒烟测试验证重试与收敛：
+3. 投递路径为 ``POST /gateway/alerts``；终态核对路径为
+   ``POST /gateway/deliveries/resolve``：发送端四次投递用尽且结果全部未知时，
+   原子地给出“已接纳 / 已封存（永不接纳）”的确定结论（见
+   :meth:`ReceiverStore.resolve`）。故障注入只作用于投递路径，不作用于核对；
+4. 通过 /admin/faults 注入网络/服务故障，供冒烟测试验证重试与收敛：
    - http_error: 前 N 次请求返回指定状态码（默认 503，可重试）
    - always:    始终返回指定状态码（默认 404，演示 4xx 立即失败）
    - drop_before_accept: 前 N 次直接断开连接（尚未接纳）
@@ -26,9 +30,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
 from .signing import signature_valid
-from .store import ReceiverStore
+from .store import STATE_SEALED, ReceiverStore
 
 DELIVERIES_PATH = "/gateway/alerts"
+RESOLVE_PATH = "/gateway/deliveries/resolve"
 
 
 class FaultController:
@@ -127,6 +132,8 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
                         {
                             "deliveryId": d["delivery_id"],
                             "alertId": d["alert_id"],
+                            "state": d["state"],
+                            "sealed": d["state"] == STATE_SEALED,
                             "acceptedAt": d["accepted_at"],
                         }
                         for d in store.list_deliveries()
@@ -143,6 +150,19 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
             if self.path == "/admin/reset":
                 store.reset()
                 self._send_json(200, {"message": "已清空接纳记录"})
+                return
+            # 终态核对不经过故障脚本：它的存在意义就是在投递链路超时/中断时
+            # 给出确定结论，故必须始终可判定。
+            if self.path == RESOLVE_PATH:
+                try:
+                    self._handle_resolve()
+                except (sqlite3.Error, OSError):
+                    # 存储异常/进程关闭竞态：返回 5xx，发送端按“结论未知”继续
+                    # 核对，绝不向 stderr 抛栈。
+                    try:
+                        self._send_json(500, {"error": "终态核对暂不可用，请重试"})
+                    except OSError:
+                        pass
                 return
             if self.path != DELIVERIES_PATH:
                 self._send_json(404, {"error": "not found"})
@@ -237,10 +257,73 @@ def build_handler(store: ReceiverStore, secret: str, faults: FaultController):
                         "duplicate": True,
                     },
                 )
+            elif mode == "sealed":
+                # 发送端已经终态核对并判失败；此 deliveryId 永不接纳，
+                # 迟到的慢处理请求必须被拒绝。
+                self._send_json(
+                    410,
+                    {
+                        "error": "该 deliveryId 已终态封存，永不接纳",
+                        "deliveryId": delivery_id,
+                    },
+                )
             else:
                 self._send_json(
                     409,
                     {"error": "同 deliveryId 请求体与首次接纳不一致，疑似篡改"},
+                )
+
+        def _handle_resolve(self) -> None:
+            """投递用尽后的原子终态核对，结论可判定且不被故障脚本影响。"""
+            delivery_id = self.headers.get("X-Delivery-Id", "")
+            alert_id = self.headers.get("X-Alert-Id", "")
+            signature = self.headers.get("X-Signature", "")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+            except ValueError:
+                self._send_json(400, {"error": "Content-Length 无效"})
+                return
+            # 与投递路径相同的共享密钥鉴权：未持有密钥者不得封存他人投递。
+            if (
+                not delivery_id
+                or not signature_valid(secret, delivery_id, raw, signature)
+            ):
+                self._send_json(401, {"error": "终态核对签名校验失败"})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict):
+                payload = {}
+            delivery_id = str(payload.get("deliveryId") or delivery_id)
+            alert_id = str(payload.get("alertId") or alert_id)
+            if not delivery_id or not alert_id:
+                self._send_json(
+                    400, {"error": "缺少 deliveryId/alertId"}
+                )
+                return
+            outcome = store.resolve(delivery_id, alert_id)
+            if outcome == "accepted":
+                self._send_json(
+                    200,
+                    {
+                        "outcome": "accepted",
+                        "message": "该 deliveryId 此前已接纳",
+                        "deliveryId": delivery_id,
+                        "duplicate": True,
+                    },
+                )
+            else:
+                self._send_json(
+                    200,
+                    {
+                        "outcome": "sealed",
+                        "message": "确认从未接纳并已封存：此后同 deliveryId 永不接纳",
+                        "deliveryId": delivery_id,
+                        "duplicate": False,
+                    },
                 )
 
         def _admit_then_drop(

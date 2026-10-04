@@ -97,6 +97,26 @@ class ReceiverStoreTests(unittest.TestCase):
         self.assertEqual(self.store.admit("dlv-1", "alt-1", "fp-other"), "tampered")
         self.assertEqual(self.store.count(), 1)
 
+    def test_resolve_seals_unknown_and_blocks_late_admit(self):
+        # 终态核对：从未接纳 -> 当场封存
+        self.assertEqual(self.store.resolve("dlv-1", "alt-1"), "sealed")
+        # 封存幂等：再次核对仍是 sealed
+        self.assertEqual(self.store.resolve("dlv-1", "alt-1"), "sealed")
+        # 迟到投递（慢处理线程醒来）必须被拒绝，且不能改写封存
+        self.assertEqual(self.store.admit("dlv-1", "alt-1", "fp"), "sealed")
+        self.assertEqual(self.store.admit("dlv-1", "alt-1", "fp-other"), "sealed")
+        [row] = self.store.list_deliveries()
+        self.assertEqual(row["state"], "sealed")
+        self.assertEqual(self.store.count(), 1)
+
+    def test_resolve_after_accept_reports_accepted(self):
+        self.assertEqual(self.store.admit("dlv-2", "alt-2", "fp"), "new")
+        self.assertEqual(self.store.resolve("dlv-2", "alt-2"), "accepted")
+        # 已接纳记录不被封存影响，仍可幂等重放
+        self.assertEqual(self.store.admit("dlv-2", "alt-2", "fp"), "duplicate")
+        [row] = self.store.list_deliveries()
+        self.assertEqual(row["state"], "accepted")
+
 
 if __name__ == "__main__":
     unittest.main()
