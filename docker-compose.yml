@@ -1,0 +1,75 @@
+services:
+  receiver:
+    build: .
+    image: seismic-alert-relay:latest
+    command: ["python", "-m", "relay.receiver"]
+    environment:
+      RECEIVER_HOST: 0.0.0.0
+      RECEIVER_PORT: "8081"
+      RECEIVER_DB: /data/receiver.db
+      SHARED_SECRET: ${SHARED_SECRET:-earthquake-relay-secret}
+    volumes:
+      - receiver-data:/data
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8081/health',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: seismic-alert-relay:latest
+    command: ["python", "-m", "relay.api"]
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: "8080"
+      API_DB: /data/api.db
+      RECEIVER_HOST: receiver
+      RECEIVER_PORT: "8081"
+      SHARED_SECRET: ${SHARED_SECRET:-earthquake-relay-secret}
+      MAX_ATTEMPTS: "4"
+      REQUEST_TIMEOUT: "3"
+      BACKOFF_BASE: "0.5"
+      WORKER_THREADS: "4"
+    ports:
+      # API 宿主机端口可通过环境变量 API_HOST_PORT 配置，默认 8080
+      - "${API_HOST_PORT:-8080}:8080"
+    volumes:
+      - api-data:/data
+    depends_on:
+      receiver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  # 一次性验证服务：汇总构建检查、代码测试、投递冒烟，退出码即结论。
+  # 运行：docker compose run --rm verify   （0 = 全部通过）
+  verify:
+    build: .
+    image: seismic-alert-relay:latest
+    command: ["python", "scripts/verify.py"]
+    environment:
+      API_URL: http://api:8080
+      RECEIVER_ADMIN: http://receiver:8081
+      SHARED_SECRET: ${SHARED_SECRET:-earthquake-relay-secret}
+    depends_on:
+      api:
+        condition: service_healthy
+      receiver:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  api-data:
+  receiver-data:
